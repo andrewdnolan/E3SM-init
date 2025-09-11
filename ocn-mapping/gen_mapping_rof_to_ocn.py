@@ -3,22 +3,25 @@
 import click
 import logging
 import numpy as np
-import os
 import re
+import shutil
 import tempfile
 import xarray as xr
 
 from datetime import datetime
+from logging import Logger
 from mache import MachineInfo, discover_machine
 from mpas_tools.io import write_netcdf
 from mpas_tools.logging import check_call
 from pathlib import Path
+from typing import Literal, NoReturn
+from xarray.core.dataarray import DataArray
 
 click_input_path = click.Path(
     exists=True, dir_okay=False, readable=True, path_type=Path
 )
 
-def calculate_spherical_quad_area(xv, yv):
+def calculate_spherical_quad_area(xv: DataArray, yv: DataArray) -> DataArray:
     """
     Calculate the area of a quadrilateral grid cell on a sphere
 
@@ -45,8 +48,13 @@ def calculate_spherical_quad_area(xv, yv):
     #TODO: Explain why this works with counter clockwise ordering
     return calc_area(yv[:, 0], yv[:, 2], xv[:, 0], xv[:, 1])
 
-def generate_mapping_file(rof_scrip, ocn_scrip, weight_fn, logger,
-                          parallel_executable=None, nprocs=1):
+def generate_mapping_file(
+    rof_scrip: Path,
+    ocn_scrip: Path,
+    weight_fn: Path,
+    logger: Logger,
+    parallel_executable: str | None = None,
+    nprocs: int = 1) -> NoReturn:
     """
     Generate the nearest neighbor mapping file
 
@@ -61,8 +69,8 @@ def generate_mapping_file(rof_scrip, ocn_scrip, weight_fn, logger,
     weight_fn: str
         filename of the resulting mapping file
 
-    parallel_executable : str
-        executable needed to launch a parallel job
+    parallel_executable : str or None
+        executable to use for a parallel job. If None, then run in serial
 
     nprocs : int
         number of processors to use for generating remapping weights
@@ -85,7 +93,7 @@ def generate_mapping_file(rof_scrip, ocn_scrip, weight_fn, logger,
 
     check_call(args, logger=logger)
 
-def area_weight_mapping_file(weight_fn, logger):
+def area_weight_mapping_file(weight_fn: Path, logger: Logger) -> NoReturn:
     """
     Area weight the nearest neighbor mapping file
 
@@ -108,7 +116,89 @@ def area_weight_mapping_file(weight_fn, logger):
 
     write_netcdf(ds, weight_fn)
 
-def mask_rof_scrip(rof_scrip, rof_mesh, mask_var, lnd_domain):
+def convert_to_scrip(rof_file: Path) -> Path:
+    """
+    Convert input file, either a domain or rtm data file, to the SCRIP format.
+
+    Parameters
+    ----------
+    rof_file : pathlib.Path
+        path of a domain or rtm data file to be converted
+
+    Returns
+    -------
+    rof_scrip : pathlib.Path
+        path to the temporary SCRIP file
+    """
+
+    def fmt_attrs(da: DataArray) -> DataArray:
+        """
+        Format the 'units' attribute for the SCRIP coordinate arrays
+
+        NOTE: This is only valid for coordinates arrays. This will not format
+        the units of the 'grid_imask' or 'grid_area' arrays correctly.
+
+        Parameters
+        ----------
+        da: xr.DataArray
+            coordinate array to parse and format the unit attribute of
+        """
+        # if units of coordinate array can not be verified, then raise error
+        if 'units' not in da.attrs:
+            raise ValueError()
+
+        if re.search("degree", da.attrs["units"]):
+            units = "degrees"
+        elif re.search("radian", da.attrs["units"]):
+            units = "radians"
+        else:
+            raise ValueError()
+
+        # wipe the existing
+        da = da.drop_attrs()
+        # add "unit" attribute following SCRIP format
+        da.attrs["units"] = units
+
+        return da
+
+    rof_ds = xr.open_dataset(rof_file)
+
+    grid_dims = np.array((rof_ds.sizes["nj"], rof_ds.sizes["ni"]))
+
+    rof_ds = rof_ds.stack(grid_size=("nj", "ni"), create_index=False)
+    rof_ds = rof_ds.rename(nv="grid_corners")
+
+    # rtm data files have "nt" dimension
+    if "nt" in rof_ds.dims:
+        rof_ds = rof_ds.drop_dims("nt")
+
+    # ensure the dimensions are order as needed by the SCRIP format
+    rof_ds = rof_ds.transpose("grid_size", "grid_corners")
+
+    if ('xc' in rof_ds.coords) and ('yc' in rof_ds.coords):
+        rof_ds = rof_ds.reset_coords(("xc", "yc"))
+
+    # should the dataset also include area and/or imask variables
+    scrip_ds = xr.Dataset({
+        "grid_dims": xr.DataArray(grid_dims, dims="grid_rank"),
+        "grid_center_lat": fmt_attrs(rof_ds["yc"]),
+        "grid_center_lon": fmt_attrs(rof_ds["xc"]),
+        "grid_corner_lat": fmt_attrs(rof_ds["yv"]),
+        "grid_corner_lon": fmt_attrs(rof_ds["xv"]),
+    })
+
+    # create the filepath to a temporary scrip file
+    tmp_dir = tempfile.mkdtemp()
+    tmp_fn = rof_file.stem + f".scrip.nc"
+    tmp_rof_scrip = Path(tmp_dir) / tmp_fn
+
+    write_netcdf(scrip_ds, tmp_rof_scrip)
+
+    return tmp_rof_scrip
+
+def mask_rof_scrip(
+    rof_scrip: Path, rof_mesh: Path, mask_var: str, lnd_domain: Path
+) -> Path:
     """
     Mask the rof scrip file based on the rof mesh variable requested and
     the union of the lnd domain file
@@ -152,16 +242,86 @@ def mask_rof_scrip(rof_scrip, rof_mesh, mask_var, lnd_domain):
     # have to set the values b/c `imask` is a np.ndarray
     scrip_ds["grid_imask"].values = imask
 
-    # create the filepath to a temporary scrip file
-    tmp_dir = tempfile.mkdtemp()
+    # if input is a tmp scrip, then place the masked scrip in the same tmp dir
+    if re.search("^/tmp/tmp", str(rof_scrip)):
+        tmp_dir = rof_scrip.parent
+    else:
+        # create the filepath to a temporary scrip file
+        tmp_dir = Path(tempfile.mkdtemp())
+
     tmp_fn = rof_scrip.stem + f".CUSTOM_{mask_var}_MASK.nc"
-    tmp_rof_scrip = Path(tmp_dir) / tmp_fn
+    tmp_rof_scrip = tmp_dir / tmp_fn
 
     write_netcdf(scrip_ds, tmp_rof_scrip)
 
     return tmp_rof_scrip
 
-def create_logger():
+def validate_input_file(
+        fp: Path, logger: Logger, limit_to: None | Literal["scrip"] = None,
+) -> Path:
+    """
+    Validates input file's type and converts to SCRIP format if appropriate.
+
+    Parameters
+    ----------
+    fp: pathlib.Path
+        Path to the input file
+    logger: logging.Logger
+        Logger to stream stdout and stderr too
+    limit_to: None or "scrip"
+        Allows certain input files to have to be "scrip" files
+
+    Returns
+    -------
+    fp: pathlib.Path
+        Path to the validate input file OR the path to a temproary file, which
+        is the input file converted to SCRIP format
+    """
+
+    def get_file_type(fp: Path) -> Literal["rtm", "domain", "scrip"]:
+        """
+        Get the type (rtm, domain, or scrip) of the input file.
+
+        NOTE: Currently this soely does this based off the filename.
+        It does not actually check that the infered file type is properly
+        formatted, by checking dimensions and/or attributes.
+
+        Parameters
+        ----------
+        fp: pathlib.Path
+            Path to the input file
+
+        Returns
+        -------
+        file_type: Literal["rtm", "domain", "scrip"]
+            String describing the input files type
+        """
+
+        if "scrip" in str(fp.stem).lower():
+            return "scrip"
+        elif "domain" in str(fp.stem).lower():
+            return "domain"
+        elif "daitren" in str(fp.stem).lower():
+            return "rtm"
+        else:
+            raise ValueError()
+
+    file_type = get_file_type(fp)
+
+    if limit_to == "scrip" and file_type != "scrip":
+        raise ValueError()
+
+    if file_type != "scrip":
+        logger.info(
+            f"Input file: {fp} is a {file_type} file. "
+            f"Converting to SCRIP format."
+        )
+
+        fp = convert_to_scrip(fp)
+
+    return fp
+
+def create_logger() -> Logger:
     """
     Create a logger and stream output to file
     """
@@ -178,15 +338,15 @@ def create_logger():
     return logger
 
 @click.command()
-@click.option('-s', '--rof_scrip', type=click_input_path)
-@click.option('-d', '--ocn_scrip', type=click_input_path)
+@click.option('-r', '--rof_file', type=click_input_path)
+@click.option('-o', '--ocn_file', type=click_input_path)
 @click.option('-w', '--weight_fn', type=Path)
 @click.option('-n', '--nprocs', type=int, default=1)
 @click.option('--rof_mesh', type=Path)
 @click.option('--mask_var', type=str)
 @click.option('--lnd_domain', type=Path)
 def gen_mapping_rof_to_ocn(
-    rof_scrip, ocn_scrip, weight_fn, nprocs, rof_mesh, mask_var, lnd_domain
+    rof_file, ocn_file, weight_fn, nprocs, rof_mesh, mask_var, lnd_domain
 ):
     """
     Generate an area weighted nearest neighbor mapping file
@@ -194,7 +354,17 @@ def gen_mapping_rof_to_ocn(
 
     logger = create_logger()
 
+    # accepts scrip, rtm, or domain files. If rtm or domain file is provided,
+    # it is converted to scrip format and written to a tmp directory
+    rof_scrip = validate_input_file(rof_file, logger)
+    # b/c ocn mesh is unstructued, we only accept scrip files as inputs
+    ocn_scrip = validate_input_file(ocn_file, logger, limit_to="scrip")
+
     if mask_var != None:
+
+        if lnd_domain == None:
+            raise ValueError()
+
         rof_scrip = mask_rof_scrip(rof_scrip, rof_mesh, mask_var, lnd_domain)
 
     parallel_executable = None
@@ -208,10 +378,9 @@ def gen_mapping_rof_to_ocn(
                           parallel_executable=parallel_executable,
                           nprocs = nprocs)
 
-    # if we generated a tmp scrip file delete to avoid clutter
+    # if we generated tmp scrip file(s) delete to avoid clutter
     if re.search("^/tmp/tmp", str(rof_scrip)):
-        os.remove(rof_scrip)
-        os.rmdir(rof_scrip.parent)
+        shutil.rmtree(rof_scrip.parent)
 
     area_weight_mapping_file(weight_fn, logger)
 
