@@ -14,7 +14,7 @@ from mache import MachineInfo, discover_machine
 from mpas_tools.io import write_netcdf
 from mpas_tools.logging import check_call
 from pathlib import Path
-from typing import Literal, NoReturn
+from typing import Literal, NoReturn, Optional
 from xarray.core.dataarray import DataArray
 
 click_input_path = click.Path(
@@ -53,7 +53,7 @@ def generate_mapping_file(
     ocn_scrip: Path,
     weight_fn: Path,
     logger: Logger,
-    parallel_executable: str | None = None,
+    parallel_executable: Optional[str] = None,
     nprocs: int = 1) -> NoReturn:
     """
     Generate the nearest neighbor mapping file
@@ -257,7 +257,7 @@ def mask_rof_scrip(
     return tmp_rof_scrip
 
 def validate_input_file(
-        fp: Path, logger: Logger, limit_to: None | Literal["scrip"] = None,
+    fp: Path, logger: Logger, limit_to: Optional[Literal["scrip"]] = None,
 ) -> Path:
     """
     Validates input file's type and converts to SCRIP format if appropriate.
