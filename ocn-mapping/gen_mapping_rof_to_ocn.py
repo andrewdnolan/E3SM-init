@@ -163,29 +163,87 @@ def convert_to_scrip(rof_file: Path) -> Path:
 
     rof_ds = xr.open_dataset(rof_file)
 
-    grid_dims = np.array((rof_ds.sizes["nj"], rof_ds.sizes["ni"]))
+    # rtm and daitren files
+    if "nj" in rof_ds.dims and "ni" in rof_ds.dims:
+        grid_dims = np.array((rof_ds.sizes["nj"], rof_ds.sizes["ni"]))
+    # mosart files
+    elif "lon" in rof_ds.dims and "lat" in rof_ds.dims:
+        grid_dims = np.array((rof_ds.sizes["lon"], rof_ds.sizes["lat"]))
+    else:
+        raise ValueError()
 
-    rof_ds = rof_ds.stack(grid_size=("nj", "ni"), create_index=False)
-    rof_ds = rof_ds.rename(nv="grid_corners")
-
-    # rtm data files have "nt" dimension
-    if "nt" in rof_ds.dims:
-        rof_ds = rof_ds.drop_dims("nt")
-
-    # ensure the dimensions are order as needed by the SCRIP format
-    rof_ds = rof_ds.transpose("grid_size", "grid_corners")
-
-    if ('xc' in rof_ds.coords) and ('yc' in rof_ds.coords):
-        rof_ds = rof_ds.reset_coords(("xc", "yc"))
-
-    # should the dataset also include area and/or imask variables
     scrip_ds = xr.Dataset({
-        "grid_dims": xr.DataArray(grid_dims, dims="grid_rank"),
-        "grid_center_lat": fmt_attrs(rof_ds["yc"]),
-        "grid_center_lon": fmt_attrs(rof_ds["xc"]),
-        "grid_corner_lat": fmt_attrs(rof_ds["yv"]),
-        "grid_corner_lon": fmt_attrs(rof_ds["xv"]),
+        "grid_dims": xr.DataArray(grid_dims, dims="grid_rank")
     })
+
+    # rtm and daitren files
+    if "nj" in rof_ds.dims and "ni" in rof_ds.dims:
+        rof_ds = rof_ds.stack(grid_size=("nj", "ni"), create_index=False)
+        rof_ds = rof_ds.rename(nv="grid_corners")
+
+        # rtm data files have "nt" dimension
+        if "nt" in rof_ds.dims:
+            rof_ds = rof_ds.drop_dims("nt")
+
+        # ensure the dimensions are order as needed by the SCRIP format
+        rof_ds = rof_ds.transpose("grid_size", "grid_corners")
+
+        if ('xc' in rof_ds.coords) and ('yc' in rof_ds.coords):
+            rof_ds = rof_ds.reset_coords(("xc", "yc"))
+
+        grid_center_lat = fmt_attrs(rof_ds["yc"])
+        grid_center_lon = fmt_attrs(rof_ds["xc"])
+        grid_corner_lat = fmt_attrs(rof_ds["yv"])
+        grid_corner_lon = fmt_attrs(rof_ds["xv"])
+
+    # mosart files
+    elif "lon" in rof_ds.dims and "lat" in rof_ds.dims:
+        lat_2d = rof_ds.latixy.values
+        lon_2d = rof_ds.longxy.values
+
+        delta_lat = lat_2d[1:, :] - lat_2d[:-1, :]
+        delta_lon = lon_2d[:, 1:] - lon_2d[:, :-1]
+
+        if not np.allclose(delta_lat, delta_lat[0, 0], rtol=0, atol=1e-12):
+            raise AssertionError("Lattitude spacing is NOT constant")
+
+        if not np.allclose(delta_lon, delta_lon[0, 0], rtol=0, atol=1e-12):
+            raise AssertionError("Longitude spacing is NOT constant")
+
+        dlat = delta_lon[0, 0]
+        dlon = delta_lat[0, 0]
+
+        grid_center_lat = xr.DataArray(
+            lat_2d.flatten(), dims="grid_size", attrs={"units": "degrees"}
+        )
+        grid_center_lon = xr.DataArray(
+            lon_2d.flatten(), dims="grid_size", attrs={"units": "degrees"}
+        )
+
+        grid_corner_lat = grid_center_lat.expand_dims(
+            dim={"grid_corners": 4}, axis=1
+        )
+        grid_corner_lon = grid_center_lon.expand_dims(
+            dim={"grid_corners": 4}, axis=1
+        )
+
+        grid_corner_lon = grid_corner_lon + dlon * np.array([[-1, 1, 1, -1]])
+        grid_corner_lat = grid_corner_lat + dlat * np.array([[-1, -1, 1, 1]])
+        # after the broadcasting attrs are wipped out, so manually reset
+        grid_corner_lon.attrs["units"] = "degrees"
+        grid_corner_lat.attrs["units"] = "degrees"
+    else:
+        raise ValueError()
+
+    scrip_ds["grid_center_lon"] = grid_center_lon
+    scrip_ds["grid_center_lat"] = grid_center_lat
+    scrip_ds["grid_corner_lon"] = grid_corner_lon
+    scrip_ds["grid_corner_lat"] = grid_corner_lat
+
+    scrip_ds['grid_area'] = calculate_spherical_quad_area(
+        scrip_ds.grid_corner_lon, scrip_ds.grid_corner_lat
+    )
+    scrip_ds['grid_area'].attrs["units"] = "square radians"
 
     # create the filepath to a temporary scrip file
     tmp_dir = tempfile.mkdtemp()
@@ -278,7 +336,7 @@ def validate_input_file(
         is the input file converted to SCRIP format
     """
 
-    def get_file_type(fp: Path) -> Literal["rtm", "domain", "scrip"]:
+    def get_file_type(fp: Path) -> Literal["rtm", "domain", "scrip", "mosart"]:
         """
         Get the type (rtm, domain, or scrip) of the input file.
 
@@ -303,6 +361,8 @@ def validate_input_file(
             return "domain"
         elif "daitren" in str(fp.stem).lower():
             return "rtm"
+        elif "mosart" in str(fp.stem).lower():
+            return "mosart"
         else:
             raise ValueError()
 
