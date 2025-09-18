@@ -210,8 +210,8 @@ def convert_to_scrip(rof_file: Path) -> Path:
         if not np.allclose(delta_lon, delta_lon[0, 0], rtol=0, atol=1e-12):
             raise AssertionError("Longitude spacing is NOT constant")
 
-        dlat = delta_lon[0, 0]
-        dlon = delta_lat[0, 0]
+        dlat = delta_lon[0, 0] / 2.
+        dlon = delta_lat[0, 0] / 2.
 
         grid_center_lat = xr.DataArray(
             lat_2d.flatten(), dims="grid_size", attrs={"units": "degrees"}
