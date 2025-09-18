@@ -2,6 +2,7 @@
 
 import click
 import logging
+import netCDF4
 import numpy as np
 import re
 import shutil
@@ -9,6 +10,7 @@ import tempfile
 import xarray as xr
 
 from datetime import datetime
+from enum import Enum, auto
 from logging import Logger
 from mache import MachineInfo, discover_machine
 from mpas_tools.io import write_netcdf
@@ -20,6 +22,43 @@ from xarray.core.dataarray import DataArray
 click_input_path = click.Path(
     exists=True, dir_okay=False, readable=True, path_type=Path
 )
+
+class FileType(Enum):
+    DAITREN = auto()
+    MOSART = auto()
+    RTM = auto()
+    SCRIP = auto()
+
+def detect_file_type(path: Path) -> FileType:
+    """
+    Detect the type (daitren/mosart/rtm/scrip) of the input file.
+
+    NOTE: Currently this soely does this based off the filename.
+    It does not actually check that the infered file type is properly
+    formatted, by checking dimensions and/or attributes.
+
+    Parameters
+    ----------
+    fp: pathlib.Path
+        Path to the input file
+
+    Returns
+    -------
+    FileType
+        Enum'ed file type
+    """
+    stem = str(path.stem).lower()
+
+    if "scrip" in stem:
+        return FileType.SCRIP
+    elif "domain" in stem:
+        return FileType.DOMAIN
+    elif "daitren" in stem:
+        return FileType.RTM
+    elif "mosart" in stem:
+        return FileType.MOSART
+    else:
+        raise ValueError()
 
 def calculate_spherical_quad_area(xv: DataArray, yv: DataArray) -> DataArray:
     """
@@ -118,7 +157,7 @@ def area_weight_mapping_file(weight_fn: Path, logger: Logger) -> NoReturn:
 
 def convert_to_scrip(rof_file: Path) -> Path:
     """
-    Convert input file, either a domain or rtm data file, to the SCRIP format.
+    Convert input file (daitren/mosart/rtm) to the SCRIP format.
 
     Parameters
     ----------
@@ -162,13 +201,12 @@ def convert_to_scrip(rof_file: Path) -> Path:
         return da
 
     rof_ds = xr.open_dataset(rof_file)
+    rof_file_type = detect_file_type(rof_file)
 
-    # rtm and daitren files
-    if "nj" in rof_ds.dims and "ni" in rof_ds.dims:
+    if rof_file_type in (FileType.DAITREN, FileType.RTM):
         grid_dims = np.array((rof_ds.sizes["nj"], rof_ds.sizes["ni"]))
-    # mosart files
-    elif "lon" in rof_ds.dims and "lat" in rof_ds.dims:
-        grid_dims = np.array((rof_ds.sizes["lon"], rof_ds.sizes["lat"]))
+    elif rof_file_type is FileType.MOSART:
+        grid_dims = np.array((rof_ds.sizes["lat"], rof_ds.sizes["lon"]))
     else:
         raise ValueError()
 
@@ -176,8 +214,7 @@ def convert_to_scrip(rof_file: Path) -> Path:
         "grid_dims": xr.DataArray(grid_dims, dims="grid_rank")
     })
 
-    # rtm and daitren files
-    if "nj" in rof_ds.dims and "ni" in rof_ds.dims:
+    if rof_file_type in (FileType.DAITREN, FileType.RTM):
         rof_ds = rof_ds.stack(grid_size=("nj", "ni"), create_index=False)
         rof_ds = rof_ds.rename(nv="grid_corners")
 
@@ -196,8 +233,7 @@ def convert_to_scrip(rof_file: Path) -> Path:
         grid_corner_lat = fmt_attrs(rof_ds["yv"])
         grid_corner_lon = fmt_attrs(rof_ds["xv"])
 
-    # mosart files
-    elif "lon" in rof_ds.dims and "lat" in rof_ds.dims:
+    elif rof_file_type is FileType.MOSART:
         lat_2d = rof_ds.latixy.values
         lon_2d = rof_ds.longxy.values
 
@@ -232,8 +268,6 @@ def convert_to_scrip(rof_file: Path) -> Path:
         # after the broadcasting attrs are wipped out, so manually reset
         grid_corner_lon.attrs["units"] = "degrees"
         grid_corner_lat.attrs["units"] = "degrees"
-    else:
-        raise ValueError()
 
     scrip_ds["grid_center_lon"] = grid_center_lon
     scrip_ds["grid_center_lat"] = grid_center_lat
@@ -259,7 +293,7 @@ def mask_rof_scrip(
     rof_scrip: Path, rof_mesh: Path, mask_var: str, lnd_domain: Path
 ) -> Path:
     """
-    Mask the rof scrip file based on the rof mesh variable requested and
+    Mask the rof scrip file based on the MOSART variable requested and
     the union of the lnd domain file
 
     Parameters
@@ -315,72 +349,38 @@ def mask_rof_scrip(
 
     return tmp_rof_scrip
 
-def validate_input_file(
-    fp: Path, logger: Logger, limit_to: Optional[Literal["scrip"]] = None,
-) -> Path:
+def add_grid_size_dimensions(
+    weights_fn: Path, rof_scrip: Path, ocn_scrip: Path
+) -> NoReturn:
     """
-    Validates input file's type and converts to SCRIP format if appropriate.
+    Add the missing dimensions cpl6 needs to decompose the mapping files
+
+    netCDF4 has to be used directly here, becuase xarray does not support
+    dimensions that are not used by any of dataarrays within the dataset
 
     Parameters
     ----------
-    fp: pathlib.Path
-        Path to the input file
-    logger: logging.Logger
-        Logger to stream stdout and stderr too
-    limit_to: None or "scrip"
-        Allows certain input files to have to be "scrip" files
+    weights_fn : str
+        filepath to the weight file to area weighted
 
-    Returns
-    -------
-    fp: pathlib.Path
-        Path to the validate input file OR the path to a temproary file, which
-        is the input file converted to SCRIP format
+    rof_scrip : str
+        filepath to the SCRIP file describing the rof grid
+
+    ocn_scrip : str
+        filepath to the SCRIP file describing the ocn grid
     """
+    rof_ds = xr.open_dataset(rof_scrip)
+    ocn_ds = xr.open_dataset(ocn_scrip)
 
-    def get_file_type(fp: Path) -> Literal["rtm", "domain", "scrip", "mosart"]:
-        """
-        Get the type (rtm, domain, or scrip) of the input file.
+    nj_a, ni_a = rof_ds.grid_dims.values
+    nj_b, ni_b = 1, ocn_ds.sizes["grid_size"]
 
-        NOTE: Currently this soely does this based off the filename.
-        It does not actually check that the infered file type is properly
-        formatted, by checking dimensions and/or attributes.
-
-        Parameters
-        ----------
-        fp: pathlib.Path
-            Path to the input file
-
-        Returns
-        -------
-        file_type: Literal["rtm", "domain", "scrip"]
-            String describing the input files type
-        """
-
-        if "scrip" in str(fp.stem).lower():
-            return "scrip"
-        elif "domain" in str(fp.stem).lower():
-            return "domain"
-        elif "daitren" in str(fp.stem).lower():
-            return "rtm"
-        elif "mosart" in str(fp.stem).lower():
-            return "mosart"
-        else:
-            raise ValueError()
-
-    file_type = get_file_type(fp)
-
-    if limit_to == "scrip" and file_type != "scrip":
-        raise ValueError()
-
-    if file_type != "scrip":
-        logger.info(
-            f"Input file: {fp} is a {file_type} file. "
-            f"Converting to SCRIP format."
-        )
-
-        fp = convert_to_scrip(fp)
-
-    return fp
+    # have to use netCDF4 b/c xarray does not allow dims not used by a field
+    with netCDF4.Dataset(weights_fn, "r+") as weights_ds:
+        weights_ds.createDimension("nj_a", nj_a)
+        weights_ds.createDimension("ni_a", ni_a)
+        weights_ds.createDimension("nj_b", nj_b)
+        weights_ds.createDimension("ni_b", ni_b)
 
 def create_logger() -> Logger:
     """
@@ -403,11 +403,10 @@ def create_logger() -> Logger:
 @click.option('-o', '--ocn_file', type=click_input_path)
 @click.option('-w', '--weight_fn', type=Path)
 @click.option('-n', '--nprocs', type=int, default=1)
-@click.option('--rof_mesh', type=Path)
 @click.option('--mask_var', type=str)
 @click.option('--lnd_domain', type=Path)
 def gen_mapping_rof_to_ocn(
-    rof_file, ocn_file, weight_fn, nprocs, rof_mesh, mask_var, lnd_domain
+    rof_file, ocn_file, weight_fn, nprocs, mask_var, lnd_domain
 ):
     """
     Generate an area weighted nearest neighbor mapping file
@@ -415,18 +414,24 @@ def gen_mapping_rof_to_ocn(
 
     logger = create_logger()
 
-    # accepts scrip, rtm, or domain files. If rtm or domain file is provided,
-    # it is converted to scrip format and written to a tmp directory
-    rof_scrip = validate_input_file(rof_file, logger)
-    # b/c ocn mesh is unstructued, we only accept scrip files as inputs
-    ocn_scrip = validate_input_file(ocn_file, logger, limit_to="scrip")
+    if mask_var != None and lnd_domain == None:
+        raise ValueError()
 
-    if mask_var != None:
+    if mask_var != None and detect_file_type(rof_file) is not FileType.MOSART:
+        raise ValueError(
+            "Masking func, which checks for NaN, only works for MOSART files"
+        )
 
-        if lnd_domain == None:
-            raise ValueError()
+    if detect_file_type(ocn_file) is not FileType.SCRIP:
+        raise ValueError()
 
-        rof_scrip = mask_rof_scrip(rof_scrip, rof_mesh, mask_var, lnd_domain)
+    if detect_file_type(rof_file) is not FileType.SCRIP:
+        rof_scrip = convert_to_scrip(rof_file)
+
+        if mask_var != None:
+            rof_scrip = mask_rof_scrip(
+                rof_scrip, rof_file, mask_var, lnd_domain
+            )
 
     parallel_executable = None
     if nprocs > 1:
@@ -435,15 +440,19 @@ def gen_mapping_rof_to_ocn(
 
         parallel_executable = config.get("parallel", "parallel_executable")
 
-    generate_mapping_file(rof_scrip, ocn_scrip, weight_fn, logger,
-                          parallel_executable=parallel_executable,
-                          nprocs = nprocs)
+    generate_mapping_file(
+        rof_scrip, ocn_file, weight_fn, logger, parallel_executable, nprocs
+    )
+
+    area_weight_mapping_file(weight_fn, logger)
+
+    # NOTE: this has to happen last or else xarray will drop the dims added
+    add_grid_size_dimensions(weight_fn, rof_scrip, ocn_file)
 
     # if we generated tmp scrip file(s) delete to avoid clutter
     if re.search("^/tmp/tmp", str(rof_scrip)):
         shutil.rmtree(rof_scrip.parent)
 
-    area_weight_mapping_file(weight_fn, logger)
 
 if __name__ == "__main__":
     gen_mapping_rof_to_ocn()
