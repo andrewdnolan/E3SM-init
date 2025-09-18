@@ -244,6 +244,7 @@ def convert_to_scrip(rof_file: Path) -> Path:
         scrip_ds.grid_corner_lon, scrip_ds.grid_corner_lat
     )
     scrip_ds['grid_area'].attrs["units"] = "square radians"
+    scrip_ds['grid_imask'] = xr.ones_like(grid_center_lon).drop_attrs()
 
     # create the filepath to a temporary scrip file
     tmp_dir = tempfile.mkdtemp()
